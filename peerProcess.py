@@ -2,6 +2,7 @@ import sys
 import json
 import os
 import threading
+import time
 
 from config.config_loader import load_common_config, load_peer_info
 from file_manager.logger import Logger
@@ -64,7 +65,8 @@ def main():
     connection_manager = ConnectionManager(
         peer_id,
         peer_info_list,
-        piece_manager
+        piece_manager,
+        _logger
     )
 
     server = TCPServer(
@@ -80,14 +82,30 @@ def main():
 
     connection_manager.start_outgoing_connections()
 
+    # Initial choking decision
+    connection_manager.choking_manager()
+
+    # Start periodic choking manager
+    def choking_loop():
+        while True:
+            time.sleep(common_cfg.unchoking_interval)
+            connection_manager.choking_manager()
+
+    choking_thread = threading.Thread(target=choking_loop)
+    choking_thread.daemon = True
+    choking_thread.start()
+
     # TODO (termination): exit when all peers report complete file (spec)
     # for now, block the main thread so daemon threads keep running
     try:
         while True:
             server_thread.join(timeout=1.0)
+            if piece_manager.completed() and not this_peer.has_file:
+                print(f"Peer {peer_id} has downloaded the complete file")
+                _logger.complete_download_log(peer_id)
+                break
     except KeyboardInterrupt:
         print(f"Peer {peer_id} shutting down")
-
 
 if __name__ == "__main__":
     main()

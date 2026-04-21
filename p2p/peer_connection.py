@@ -1,4 +1,5 @@
 import threading
+import random
 
 from protocol.decoder import (
     recv_message,
@@ -7,7 +8,7 @@ from protocol.decoder import (
     decode_request_payload,
     decode_piece_payload,
 )
-from protocol.encoder import encode_interested, encode_not_interested
+from protocol.encoder import encode_interested, encode_not_interested, encode_request, encode_piece, encode_have
 from protocol.message_types import MessageType
 
 
@@ -16,10 +17,12 @@ from protocol.message_types import MessageType
 # request, piece, and have is done by other modules that own those flows.
 class PeerConnection:
 
-    def __init__(self, neighbor, piece_manager, peer_id):
+    def __init__(self, neighbor, piece_manager, peer_id, connection_manager, logger):
         self.neighbor = neighbor
         self.piece_manager = piece_manager
         self.peer_id = peer_id  # our id, just for prints
+        self.connection_manager = connection_manager
+        self.logger = logger
 
         self.running = False
         self.thread = None
@@ -92,23 +95,39 @@ class PeerConnection:
     def _on_choke(self):
         self.neighbor.peer_choking = True
         print(f"Peer {self.peer_id} is choked by {self.neighbor.peer_id}")
+        self.logger.choking_log(self.peer_id, self.neighbor.peer_id)
+
 
     def _on_unchoke(self):
         self.neighbor.peer_choking = False
         print(f"Peer {self.peer_id} is unchoked by {self.neighbor.peer_id}")
-        # TODO (request flow): pick a random missing piece this peer has and send REQUEST
+        self.logger.unchoking_log(self.peer_id, self.neighbor.peer_id)
+        # Pick a random missing piece this peer has and send REQUEST
+        if self.neighbor.am_interested and not self.neighbor.peer_choking:
+            missing_pieces = [
+                i for i in range(self.piece_manager.num_pieces)
+                if self.neighbor.bitfield.has_piece(i) and not self.piece_manager.bitfield.has_piece(i)
+            ]
+            if missing_pieces:
+                piece_index = random.choice(missing_pieces)
+                self.neighbor.sock.sendall(encode_request(piece_index))
+                print(f"Peer {self.peer_id} requesting piece {piece_index} from {self.neighbor.peer_id}")
 
     def _on_interested(self):
         self.neighbor.peer_interested = True
         print(f"Peer {self.peer_id} received INTERESTED from {self.neighbor.peer_id}")
+        self.logger.rec_interested_message_log(self.peer_id, self.neighbor.peer_id)
 
     def _on_not_interested(self):
         self.neighbor.peer_interested = False
         print(f"Peer {self.peer_id} received NOT_INTERESTED from {self.neighbor.peer_id}")
+        self.logger.rec_not_interested_message_log(self.peer_id, self.neighbor.peer_id)
+
 
     def _on_have(self, piece_index):
         self.neighbor.bitfield.set_piece(piece_index)
         print(f"Peer {self.peer_id} received HAVE({piece_index}) from {self.neighbor.peer_id}")
+        self.logger.rec_have_message_log(self.peer_id, self.neighbor.peer_id, piece_index)
 
         # if this is a piece we don't have, we might newly be interested
         if not self.piece_manager.bitfield.has_piece(piece_index):
@@ -125,7 +144,11 @@ class PeerConnection:
 
     def _on_request(self, piece_index):
         print(f"Peer {self.peer_id} received REQUEST({piece_index}) from {self.neighbor.peer_id}")
-        # TODO (piece flow): if we are NOT choking this peer, send them the piece
+        # If we are NOT choking this peer, send them the piece
+        if not self.neighbor.am_choking and self.piece_manager.bitfield.has_piece(piece_index):
+            data = self.piece_manager.get_piece(piece_index)
+            self.neighbor.sock.sendall(encode_piece(piece_index, data))
+            print(f"Peer {self.peer_id} sending piece {piece_index} to {self.neighbor.peer_id}")
 
     def _on_piece(self, piece_index, data):
         self.neighbor.bytes_downloaded += len(data)
@@ -135,8 +158,23 @@ class PeerConnection:
             f"Peer {self.peer_id} downloaded piece {piece_index} from "
             f"{self.neighbor.peer_id} (now has {self.piece_manager.piece_count()})"
         )
-        # TODO (request flow): broadcast HAVE to all neighbors, then send the next REQUEST
+        self.logger.downloading_piece_log(self.peer_id, self.neighbor.peer_id, piece_index, self.piece_manager.piece_count())
 
+
+        # Broadcast HAVE to all neighbors, then send the next REQUEST
+        for neighbor in self.connection_manager.neighbors.values():
+            neighbor.sock.sendall(encode_have(piece_index))
+        
+        # Send next REQUEST to this neighbor (similar to _on_unchoke)
+        if self.neighbor.am_interested and not self.neighbor.peer_choking:
+            missing_pieces = [
+                i for i in range(self.piece_manager.num_pieces)
+                if self.neighbor.bitfield.has_piece(i) and not self.piece_manager.bitfield.has_piece(i)
+            ]
+            if missing_pieces:
+                next_piece = random.choice(missing_pieces)
+                self.neighbor.sock.sendall(encode_request(next_piece))
+                print(f"Peer {self.peer_id} requesting piece {next_piece} from {self.neighbor.peer_id}")
     def _reevaluate_interest(self):
         # are any of their pieces ones we don't have?
         wants_something = False

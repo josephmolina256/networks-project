@@ -1,6 +1,6 @@
 from networking.client import connect_to_peer
 from protocol import handshake
-from protocol.encoder import encode_bitfield, encode_interested, encode_not_interested
+from protocol.encoder import encode_bitfield, encode_interested, encode_not_interested, encode_choke, encode_unchoke
 from protocol.decoder import recv_message, decode_bitfield_payload
 from protocol.message_types import MessageType
 
@@ -10,11 +10,12 @@ from p2p.peer_connection import PeerConnection
 
 class ConnectionManager:
 
-    def __init__(self, peer_id, peer_info_list, piece_manager):
+    def __init__(self, peer_id, peer_info_list, piece_manager, logger):
 
         self.peer_id = peer_id
         self.peer_info_list = peer_info_list
         self.piece_manager = piece_manager
+        self.logger = logger
 
         # peer_id -> NeighborState
         self.neighbors = {}
@@ -43,6 +44,7 @@ class ConnectionManager:
                         continue
 
                     print(f"Peer {self.peer_id} makes a connection to Peer {remote_id}")
+                    self.logger.tcp_log_connect(self.peer_id, remote_id)
 
                     self._setup_neighbor(sock, remote_id)
 
@@ -52,6 +54,7 @@ class ConnectionManager:
         handshake.send(conn, self.peer_id)
 
         print(f"Peer {self.peer_id} is connected from Peer {remote_id}")
+        self.logger.tcp_log_connected_from(self.peer_id, remote_id)
 
         self._setup_neighbor(conn, remote_id)
 
@@ -98,13 +101,16 @@ class ConnectionManager:
             neighbor.am_interested = True
             sock.sendall(encode_interested())
             print(f"Peer {self.peer_id} sending INTERESTED to {remote_id}")
+            self.logger.rec_interested_message_log(self.peer_id, remote_id)  # Wait, this is sending, not receiving. Maybe keep as print or add a send method.
+
         else:
             neighbor.am_interested = False
             sock.sendall(encode_not_interested())
             print(f"Peer {self.peer_id} sending NOT_INTERESTED to {remote_id}")
+            self.logger.rec_not_interested_message_log(self.peer_id, remote_id)  # Similarly, this is sending.
 
         # kick off the receive loop for the rest of this peer's lifetime
-        pc = PeerConnection(neighbor, self.piece_manager, self.peer_id)
+        pc = PeerConnection(neighbor, self.piece_manager, self.peer_id, self, self.logger)
         self.peer_connections[remote_id] = pc
         pc.start()
 
@@ -122,3 +128,27 @@ class ConnectionManager:
         if peer_id in self.neighbors:
             self.neighbors[peer_id].close()
             del self.neighbors[peer_id]
+
+    def choking_manager(self):
+        # Simple choking: unchoke up to 3 interested peers with highest download rates
+        interested_neighbors = [
+            n for n in self.neighbors.values() 
+            if n.peer_interested
+        ]
+        
+        # Sort by bytes_downloaded descending
+        interested_neighbors.sort(key=lambda n: n.bytes_downloaded, reverse=True)
+        
+        # Unchoke top 3, choke the rest
+        for i, neighbor in enumerate(self.neighbors.values()):
+            should_choke = i >= 3 or neighbor not in interested_neighbors[:3]
+            if should_choke and not neighbor.am_choking:
+                neighbor.am_choking = True
+                neighbor.sock.sendall(encode_choke())
+            elif not should_choke and neighbor.am_choking:
+                neighbor.am_choking = False
+                neighbor.sock.sendall(encode_unchoke())
+        
+        # Reset download counters for next interval
+        for neighbor in self.neighbors.values():
+            neighbor.bytes_downloaded = 0
